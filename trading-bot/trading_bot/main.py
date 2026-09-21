@@ -1,14 +1,68 @@
-"""Orquestador: en cada ejecución, hace pasar el trabajo por los cuatro agentes en cadena.
+"""Orquestador: hace pasar el trabajo por los agentes en cadena.
 
-analista de mercado -> estratega -> gestor de riesgo -> ejecutor (+ registrador)
+analista de mercado + [noticias -> fundamentales] -> estratega -> gestor de riesgo -> ejecutor (+ registrador)
+
+Ver prompts/spec-agentes-noticias-fundamentales.md para el diseño del bloque
+noticias -> fundamentales.
 """
 
-from . import config, data, executor, registrador, risk, strategy
+import requests
+
+from . import combinador, config, data, executor, noticias, registrador, risk, strategy
+
+
+def _senal_noticias_fundamentales() -> str:
+    """Devuelve 'comprar' / 'vender' / 'esperar' a partir del pipeline de noticias+fundamentales.
+
+    Degrada con seguridad a 'esperar' si falta configuración o si alguna fuente falla:
+    nunca debe tumbar el ciclo de la estrategia técnica ya existente.
+    """
+    if not config.FINNHUB_API_KEY:
+        print("[noticias+fundamentales] FINNHUB_API_KEY no configurada: bloque desactivado por ahora.")
+        return "esperar"
+
+    try:
+        candidatas = noticias.analizar_noticias([config.SYMBOL])
+    except requests.RequestException as exc:
+        print(f"[noticias] Fuente no disponible: {exc}")
+        return "esperar"
+
+    for candidata in candidatas:
+        registrador.registrar_analisis(
+            "noticias", candidata.ticker, candidata.__dict__,
+            candidata.decision, candidata.motivo_decision, candidata.version_criterios,
+        )
+
+    try:
+        combinadas = combinador.combinar(candidatas)
+    except requests.RequestException as exc:
+        print(f"[fundamentales] Fuente no disponible: {exc}")
+        return "esperar"
+
+    senal_final = "esperar"
+    for señal in combinadas:
+        registrador.registrar_analisis(
+            "fundamentales", señal.ticker, señal.fundamentales,
+            señal.fundamentales.get("veredicto", "desconocido"),
+            señal.fundamentales.get("motivo", ""),
+            señal.fundamentales.get("version_criterios", ""),
+        )
+        registrador.registrar_analisis(
+            "combinado", señal.ticker, señal.__dict__,
+            señal.veredicto_combinado, f"confianza={señal.confianza_combinada}", "combinado-v1",
+        )
+        if señal.ticker == config.SYMBOL and señal.veredicto_combinado == "candidata_para_riesgo":
+            senal_final = señal.senal_risk
+
+    return senal_final
 
 
 def ejecutar_ciclo():
     precios = data.obtener_precios_diarios()
-    senal = strategy.generar_senal(precios)
+    senal_tecnica = strategy.generar_senal(precios)
+    senal_noticias_fund = _senal_noticias_fundamentales()
+    senal = combinador.resolver_conflicto(senal_tecnica, senal_noticias_fund)
+
     precio_actual = float(precios["close"].iloc[-1])
 
     cliente = executor.cliente_trading()
@@ -24,7 +78,7 @@ def ejecutar_ciclo():
     )
 
     if not decision.permitido:
-        print(f"[{config.SYMBOL}] Señal: {senal} -> Sin acción. Motivo: {decision.motivo}")
+        print(f"[{config.SYMBOL}] Señal técnica={senal_tecnica} noticias+fundamentales={senal_noticias_fund} -> combinada={senal} -> Sin acción. Motivo: {decision.motivo}")
         registrador.registrar(config.SYMBOL, senal, "sin_accion", 0, decision.motivo)
         return
 

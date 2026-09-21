@@ -4,4 +4,5 @@ __pycache__/
 venv/
 .venv/
 trading-bot/logs/
+trading-bot/cache/
 trading-bot/*.csv
